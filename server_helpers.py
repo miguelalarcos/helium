@@ -9,18 +9,18 @@ db = motor.MotorClient().testing_server
 q_command = Queue()
 q_send = Queue()
 
-
-
 db['Coche'].remove()
 db['Persona'].remove()
 db['User'].remove()
 
 filters = {}
 
+
 def register_filter(f):
     filters[f.__name__] = f
 
 documents = {}
+
 
 def register_document(d):
     documents[d.__name__] = d
@@ -28,18 +28,25 @@ def register_document(d):
 
 current_user = 'user'
 
+
 class Document:
     def __init__(self, **kwargs):
         for r1, T, r2 in self.relations:
-            setattr(self, r1, (T, [], [], [])) # pasarlo a diccionario: ids, query, read
-        self.write = []
+            setattr(self, r1, (T, [], [], [], [])) # pasarlo a diccionario: ids, query, read, write
+        # self.write = []
         self.owner = current_user
         self.__dict__.update(kwargs)        
+
+    def can_write(self, user, relation):
+        return user in getattr(self, relation)[4]
 
     def get_reverse(self, rel):
         for r1, T, r2 in self.relations:
             if r1 == rel:
-                return r2    
+                return r2
+
+    def dumps(self):
+        return {k: v for k,v in self.__dict__.items() if k=='_id' or k in self.attributes}
 
     @staticmethod
     @gen.coroutine
@@ -65,35 +72,39 @@ class Document:
         doc = yield db[T].find_one(_id)
         if doc:
             if current_user == doc['owner']:
-                yield db[T].update({'_id': _id}, {'$addToSet': {relation+'.3': user_id}})
+                yield db[T].update({'_id': _id}, {'$pullAll': {relation+'.3': user_id}})
 
     @staticmethod
     @gen.coroutine
-    def give_write_perm(T, _id, user_id):
+    def give_write_perm(T, _id, relation, user_id):
         doc = yield db[T].find_one(_id)
         if doc:            
             if current_user == doc['owner']: 
-                yield db[T].update({'_id': _id}, {'$addToSet': {'write': user_id}})
+                yield db[T].update({'_id': _id}, {'$addToSet': {relation+'.4': user_id}})
 
     @staticmethod
     @gen.coroutine
-    def revoke_write_perm(T, _id, user_id):
+    def revoke_write_perm(T, _id, relation, user_id):
         doc = yield db[T].find_one(_id)
         if doc:
             if current_user == doc['owner']:
-                yield db[T].update({'_id': _id}, {'$pullAll': {'write': user_id}})
+                yield db[T].update({'_id': _id}, {'$pullAll': {relation+'.4': user_id}})
 
     @staticmethod
     @gen.coroutine
-    def update(T, _id, **kwargs):
-        doc = yield db[T].find_one(_id)
-        if doc:
-            doc = documents[T](**doc)
-            for k in kwargs.keys():
-                if k not in documents[T].attributes:
-                    return
-            doc.__dict__.update(kwargs)
-            if current_user in doc.write: 
+    def update(P, P_id, relation, T, _id, **kwargs):
+        doc = yield db[P].find_one(P_id)
+        if not doc:
+            return
+        a = documents[P](**doc)
+        if a.can_write(current_user, relation):
+            doc = yield db[T].find_one(_id)
+            if doc:
+                doc = documents[T](**doc)
+                for k in kwargs.keys():
+                    if k not in documents[T].attributes:
+                        return
+                doc.__dict__.update(kwargs)
                 yield db[T].update({'_id': _id}, {'$set': kwargs})
                 for r1, T, r2 in doc.relations:
                     yield doc.update_relation(r1, r2, kwargs)
@@ -101,7 +112,6 @@ class Document:
     @gen.coroutine
     def update_relation(self, self_rel, rel, kw):        
         T = getattr(self, self_rel)[0]
-        
         ids = getattr(self, self_rel)[1]
         cursor = db[T].find({'_id': {'$in': ids}})
         docs = yield cursor.to_list(length=len(ids))
@@ -110,32 +120,35 @@ class Document:
             r.check(rel, self, kw)
 
     def check(self, relation, doc, kw=None):
-        for q in getattr(self, relation)[2]:            
+        for q in getattr(self, relation)[2]:
             if filters[q['name']](doc, **q['parameters']):
-                print(q['users'], relation, '>>', kw or {k: v for k,v in doc.__dict__.items() if k in doc.attributes})
+                print(q['user'], relation, '>>', kw or doc.dumps())
+                if kw:
+                    kw['_id'] = self._id
+                q_send.put(kw or doc.dumps())
 
     @staticmethod            
     def check_query(relation, doc, q):
         if filters[q['name']](doc, **q['parameters']):
-            print(q['users'], relation, '>>', {k: v for k,v in doc.__dict__.items() if k in doc.attributes})        
+            print(q['user'], relation, '>>', doc.dumps())
+            q_send.put(doc.dumps())
 
     @staticmethod
     @gen.coroutine
-    def add_relation(A, a_id, B, b_id, relation_a, reverse=True):
+    def add_relation(A, a_id, B, b_id, relation_a):
         a = yield db[A].find_one(a_id)
         if a:            
             a = documents[A](**a)
-            relation_b = a.get_reverse(relation_a)
-            if relation_b:
-                b = yield db[B].find_one(b_id)
-                if b:
-                    b = documents[B](**b)
-                    if current_user in a.write and current_user in b.write:
-                        yield db[A].update({'_id': a_id}, {'$addToSet': {relation_a+'.1': b_id}})
-                        a.check(relation_a, b)
-                        if reverse:
-                            yield db[B].update({'_id': b_id}, {'$addToSet': {relation_b+'.1': a_id}})
-                            b.check(relation_b, a)                
+            b = yield db[B].find_one(b_id)
+            if b:
+                b = documents[B](**b)
+                relation_b = a.get_reverse(relation_a)
+                if a.can_write(current_user, relation_a):
+                    yield db[A].update({'_id': a_id}, {'$addToSet': {relation_a+'.1': b_id}})
+                    a.check(relation_a, b)
+                    if relation_b and b.can_write(current_user, relation_b):
+                        yield db[B].update({'_id': b_id}, {'$addToSet': {relation_b+'.1': a_id}})
+                        b.check(relation_b, a)
 
     @staticmethod
     @gen.coroutine
@@ -143,18 +156,18 @@ class Document:
         a = yield db[A].find_one(a_id)
         if a:
             a = documents[A](**a)
-            relation_b = a.get_reverse(relation_a)
-            if relation_b:
-                b = yield db[B].find_one(b_id)
-                if b:
-                    b = documents[B](**b)
-                    if current_user in a.write and current_user in b.write:
-                        yield db[A].update({'_id': a_id}, {'$pullAll': {relation_a+'.1': [b_id]}})
+            b = yield db[B].find_one(b_id)
+            if b:
+                b = documents[B](**b)
+                relation_b = a.get_reverse(relation_a)
+                if a.can_write(current_user, relation_a):
+                    yield db[A].update({'_id': a_id}, {'$pullAll': {relation_a+'.1': [b_id]}})
+                    for q in getattr(a, relation_a)[2]:
+                        print(q['user'], relation_a, '>> remove:', a_id)
+                    if relation_b:
                         yield db[B].update({'_id': b_id}, {'$pullAll': {relation_b+'.1': [a_id]}})
-                        for q in getattr(a, relation_a)[2]:
-                            print(q['users'], relation_a, '>> remove:', a_id)                
                         for q in getattr(b, relation_b)[2]:
-                            print(q['users'], relation_b, '>> remove:', b_id)                   
+                            print(q['user'], relation_b, '>> remove:', b_id)
 
     @staticmethod
     @gen.coroutine
@@ -172,7 +185,7 @@ class Document:
                     d = documents[T](**d)
                     Document.check_query(relation, d, query)
 
-    #remove or stop query
+    #remove or stop query or replace query
 
 @gen.coroutine
 def consume_command():
@@ -214,7 +227,7 @@ if __name__ == '__main__':
     @register_document
     class User(Document):
         attributes = []
-        relations = (('conjunto_de_personas', 'Persona', '-'),)
+        relations = (('conjunto_de_personas', 'Persona', None),)
 
     @register_filter
     def filter_(coche, color='rojo'):
@@ -228,13 +241,13 @@ if __name__ == '__main__':
     Document.new('Persona', _id='0', color='azul')
     Document.new('Coche', _id='1', color='rojo')
 
-    Document.give_write_perm('Persona', '0', 'user')
-    Document.give_write_perm('Coche', '1', 'user')
+    Document.give_write_perm('Persona', '0', 'conduce', 'user')
+    #Document.give_write_perm('Coche', '1', 'user')
 
 
-    Document.add_relation('User', 'user1', 'Persona', '0', 'conjunto_de_personas', reverse=False)
+    Document.add_relation('User', 'user1', 'Persona', '0', 'conjunto_de_personas')
 
-    q = {'name': 'filter_', 'users': ['user_1'], 'parameters': {'color': 'rojo'}}
+    q = {'name': 'filter_', 'user': current_user, 'parameters': {'color': 'rojo'}}
     #Document.add_query('Persona', '0', 'conduce', q)
     print('add_relation')
     Document.add_relation('Persona', '0', 'Coche', '1', 'conduce')
